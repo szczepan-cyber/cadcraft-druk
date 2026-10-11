@@ -741,7 +741,7 @@ static PLOT_GEN: AtomicU32 = AtomicU32::new(0);
 
 /// Set while PLOTWINDOW picks the Plot dialog's window ("Window <").
 const PICKING_WINDOW: &str = "plot_picking_window";
-/// Set by Print... in a preview opened from the Plot dialog: plot as soon as the dialog is back.
+/// Set by Plot... in a preview opened from the Plot dialog: plot as soon as the dialog is back.
 pub(crate) const PLOT_NOW: &str = "plot_now";
 
 /// Every frame: once PLOTWINDOW (started by the Plot dialog's "Window <") ends, bring the dialog
@@ -876,7 +876,7 @@ fn plot(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action {
     });
     let model = st.target == "Model";
     let choices = PageChoices::new(ctx, d);
-    // Print... in a preview opened from here plots with these settings.
+    // Plot... in a preview opened from here plots with these settings.
     let mut ok = temp::<bool>(ctx, PLOT_NOW) == Some(true);
     set_temp(ctx, PLOT_NOW, false);
     let (mut cancel, mut action, mut pick, mut preview) = (false, None, false, false);
