@@ -31,12 +31,14 @@ pub enum Preference {
     French,
     #[serde(rename = "zh")]
     Chinese,
+    #[serde(rename = "zh-Hant")]
+    TraditionalChinese,
     #[serde(rename = "it")]
     Italian,
 }
 
 impl Preference {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Auto,
         Self::English,
         Self::Ukrainian,
@@ -47,6 +49,7 @@ impl Preference {
         Self::Russian,
         Self::French,
         Self::Chinese,
+        Self::TraditionalChinese,
         Self::Italian,
     ];
 
@@ -71,6 +74,7 @@ impl Preference {
             Self::Russian => "ru",
             Self::French => "fr",
             Self::Chinese => "zh",
+            Self::TraditionalChinese => "zh-Hant",
             Self::Italian => "it",
         }
     }
@@ -87,6 +91,7 @@ impl Preference {
             Self::Russian => "Русский",
             Self::French => "Français",
             Self::Chinese => "简体中文",
+            Self::TraditionalChinese => "繁體中文",
             Self::Italian => "Italiano",
         }
     }
@@ -111,6 +116,7 @@ impl Preference {
             Self::Russian => "ru",
             Self::French => "fr",
             Self::Chinese => "zh",
+            Self::TraditionalChinese => "zh-Hant",
             Self::Italian => "it",
             Self::Auto => locales.iter().find_map(|s| locale_language(s)).unwrap_or("en"),
         }
@@ -128,7 +134,7 @@ pub struct Language {
     catalog: OnceLock<Catalog<'static>>,
 }
 
-pub static LANGUAGES: [Language; 10] = [
+pub static LANGUAGES: [Language; 11] = [
     Language { code: "en", name: "English", source: "", plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
     Language {
         code: "uk", name: "Українська", source: include_str!("uk.tsv"), plural: plural_uk, plural_forms: 3, catalog: OnceLock::new()
@@ -155,13 +161,46 @@ pub static LANGUAGES: [Language; 10] = [
     Language { code: "zh", name: "简体中文", source: include_str!("zh.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
     // Italian integer plurals (CLDR `it`) follow the English rule: one (1), other.
     Language { code: "it", name: "Italiano", source: include_str!("it.tsv"), plural: plural_en, plural_forms: 2, catalog: OnceLock::new() },
+    Language {
+        code: "zh-Hant", name: "繁體中文", source: include_str!("zh-Hant.tsv"), plural: plural_zh, plural_forms: 1, catalog: OnceLock::new()
+    },
 ];
 
 /// BCP 47 and POSIX locale tags, including `uk-UA`, `uk_UA.UTF-8` and `pt_BR.UTF-8`.
 /// A catalog is chosen by the tag's primary language, so any `pt-*` tag selects `pt-BR`.
 pub fn locale_language(tag: &str) -> Option<&'static str> {
-    let primary = tag.trim().split(['-', '_', '.', '@']).next()?;
-    LANGUAGES.iter().find(|l| l.code.split('-').next().is_some_and(|p| p.eq_ignore_ascii_case(primary))).map(|l| l.code)
+    let locale = tag.trim().split(['.', '@']).next()?;
+    let mut subtags = locale.split(['-', '_']);
+    let primary = subtags.next()?;
+    if !primary.eq_ignore_ascii_case("zh") {
+        return LANGUAGES.iter().find(|l| l.code.split('-').next().is_some_and(|p| p.eq_ignore_ascii_case(primary))).map(|l| l.code);
+    }
+    // Explicit script wins over region. Hant and Traditional regions precede the generic Simplified catalog.
+    let mut script = None;
+    let mut traditional_region = false;
+    for subtag in subtags {
+        if subtag.is_empty() || !subtag.bytes().all(|c| c.is_ascii_alphanumeric()) {
+            return None;
+        }
+        if subtag.len() == 1 {
+            break; // BCP 47 extensions and private-use subtags do not change the script.
+        }
+        if subtag.len() == 4 && subtag.bytes().all(|c| c.is_ascii_alphabetic()) {
+            if script.is_some() {
+                return None;
+            }
+            script = Some(subtag);
+        } else if ["TW", "HK", "MO"].iter().any(|r| r.eq_ignore_ascii_case(subtag)) {
+            traditional_region = true;
+        }
+    }
+    match script {
+        Some(s) if s.eq_ignore_ascii_case("Hant") => Some("zh-Hant"),
+        Some(s) if s.eq_ignore_ascii_case("Hans") => Some("zh"),
+        Some(_) => None,
+        None if traditional_region => Some("zh-Hant"),
+        None => Some("zh"),
+    }
 }
 
 thread_local! {
@@ -264,6 +303,10 @@ pub fn plural_uk(n: u64) -> usize {
 /// Portuguese integer plurals (CLDR `pt`): one (0, 1), other (2 and up).
 pub fn plural_pt(n: u64) -> usize {
     usize::from(n > 1)
+}
+
+fn plural_zh(_: u64) -> usize {
+    0
 }
 
 fn plural_en(n: u64) -> usize {
