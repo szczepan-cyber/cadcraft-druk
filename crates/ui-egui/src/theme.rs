@@ -304,10 +304,11 @@ pub fn mono() -> FontId {
 /// Load a system UI font at run time when one is installed (not bundled), else keep egui's;
 /// then CJK fonts after the Latin ones, so Latin text keeps its look, in every interface
 /// language: file, layout and layer names can be Japanese or Chinese whatever the interface
-/// shows (#513). With `chinese` (a Chinese interface) the Chinese font comes first, else a
+/// shows (#513). A Chinese `language` prefers its Chinese font (zh-Hant prefers JhengHei), else a
 /// Japanese one, so names take their own glyph forms. A font embedded from craft-fonts comes
 /// last, for systems without any (and the web build, which has no system fonts).
-pub fn install_fonts(ctx: &egui::Context, chinese: bool) {
+pub fn install_fonts(ctx: &egui::Context, language: &str) {
+    let chinese = language.starts_with("zh");
     let mut fonts = egui::FontDefinitions::default();
     let mut added: Vec<(String, std::sync::Arc<egui::FontData>)> = Vec::new();
     #[cfg(target_arch = "wasm32")]
@@ -339,7 +340,7 @@ pub fn install_fonts(ctx: &egui::Context, chinese: bool) {
         if !chinese {
             paths.extend(japanese_font());
         }
-        paths.extend(cjk_font());
+        paths.extend(cjk_font_for(language));
         paths.dedup();
         added.extend(
             paths
@@ -443,7 +444,7 @@ fn japanese_font() -> Option<&'static std::path::Path> {
 
 /// Whether the interface can show `language`: Chinese needs an installed CJK font.
 pub fn can_show(language: &str) -> bool {
-    !language.starts_with("zh") || cjk_font().is_some()
+    !language.starts_with("zh") || cjk_font_for(language).is_some()
 }
 
 /// egui's visuals for `theme`, from its tokens.
@@ -496,4 +497,54 @@ pub fn apply(ctx: &egui::Context, theme: Theme, follow_system: bool) {
         s.text_styles.insert(egui::TextStyle::Small, small());
         s.text_styles.insert(egui::TextStyle::Monospace, mono());
     });
+}
+/// Only the Traditional interface may prefer an installed Traditional face.
+fn prefer_traditional<'a>(
+    language: &str,
+    traditional: Option<&'a std::path::Path>,
+    generic: Option<&'a std::path::Path>,
+) -> Option<&'a std::path::Path> {
+    if language == "zh-Hant" { traditional.or(generic) } else { generic }
+}
+
+pub fn cjk_font_for(language: &str) -> Option<&'static std::path::Path> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let traditional = if language == "zh-Hant" {
+        static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+        FOUND
+            .get_or_init(|| {
+                #[cfg(windows)]
+                let candidates = ["C:\\Windows\\Fonts\\msjh.ttc"];
+                #[cfg(not(windows))]
+                let candidates: [&str; 0] = [];
+                candidates.iter().map(std::path::PathBuf::from).find(|path| path.is_file())
+            })
+            .as_deref()
+    } else {
+        None
+    };
+    #[cfg(target_arch = "wasm32")]
+    let traditional = None;
+    prefer_traditional(language, traditional, cjk_font())
+}
+
+#[cfg(test)]
+mod traditional_font_tests {
+    use super::*;
+    #[test]
+    fn tc_priority_does_not_leak_into_other_languages() {
+        let tc = std::path::Path::new("traditional.ttc");
+        let sc = std::path::Path::new("generic.ttc");
+        assert_eq!(prefer_traditional("zh-Hant", Some(tc), Some(sc)), Some(tc));
+        for language in ["zh", "en", "ja", "it"] {
+            assert_eq!(prefer_traditional(language, Some(tc), Some(sc)), Some(sc));
+            assert_eq!(prefer_traditional(language, Some(tc), None), None);
+        }
+    }
+    #[test]
+    fn missing_tc_uses_generic_and_missing_both_returns_none() {
+        let sc = std::path::Path::new("generic.ttc");
+        assert_eq!(prefer_traditional("zh-Hant", None, Some(sc)), Some(sc));
+        assert_eq!(prefer_traditional("zh-Hant", None, None), None);
+    }
 }

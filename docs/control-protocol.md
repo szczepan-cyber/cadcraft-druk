@@ -156,3 +156,6 @@ Supported values are `auto`, `en`, `uk`, `pt-BR`, `de`, `es`, `cs`, `ru`, `fr`, 
 `{"interfaceLanguage":"uk"}`; `ui.inspect` reports the saved choice in its UI state.
 Invalid choices leave the current language unchanged. Menus, command labels and prompt text
 returned by the control channel retain their English source text. See [localization.md](localization.md).
+
+Traditional Chinese prototype: the same language controls also accept `zh-Hant`. This adds
+only a preference value; command IDs and all automation output remain English.
