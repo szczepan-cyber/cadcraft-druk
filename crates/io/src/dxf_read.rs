@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::*;
-use cadcraft_dxf::{Tag, records, sections};
+use cadcraft_dxf::{Tag, record_slices as records, section_slices as sections};
 use cadcraft_geom::{PolyVertex, Spline, Vec2, Vec3};
 
 use crate::{IoError, Result};
@@ -178,7 +178,7 @@ fn mtext_from(tags: &[Tag], c: &Common) -> MText {
     }
 }
 
-fn text_from(t: &T) -> Text {
+fn text_from(t: &T, attribute: bool) -> Text {
     let h = match t.i(72).unwrap_or(0) {
         1 => HAlign::Center,
         2 => HAlign::Right,
@@ -187,7 +187,8 @@ fn text_from(t: &T) -> Text {
         5 => HAlign::Fit,
         _ => HAlign::Left,
     };
-    let v = match t.i(73).or_else(|| t.i(74)).unwrap_or(0) {
+    // ATTRIB/ATTDEF group 73 is the unused field length, not vertical justification.
+    let v = match t.i(if attribute { 74 } else { 73 }).unwrap_or(0) {
         1 => VAlign::Bottom,
         2 => VAlign::Middle,
         3 => VAlign::Top,
@@ -241,6 +242,18 @@ fn mirror_text(t: &mut Text, align: Option<Vec3>, insert: Vec3) {
             t.align_pt = align;
         }
     }
+}
+
+/// Our 2D viewport centre is in WCS, whereas DXF group 12 is relative to the view target
+/// (group 17). For an untwisted top view the conversion is a translation. Keep the existing
+/// projection for other directions/twists, which the 2D viewport model does not yet represent.
+fn viewport_center(t: &T) -> Vec2 {
+    let center = Vec2::new(t.fd(12, 0.0), t.fd(22, 0.0));
+    // The viewing direction is not necessarily a unit vector. Test its direction, not
+    // absolute components: a long vertical vector can carry harmless rounding noise.
+    let dir = Vec3::new(t.fd(16, 0.0), t.fd(26, 0.0), t.fd(36, 1.0));
+    let top = dir.is_finite() && dir.z > 0.0 && (dir.x / dir.z).abs() < 1e-12 && (dir.y / dir.z).abs() < 1e-12;
+    if top && t.fd(51, 0.0).abs() < 1e-12 { center + t.p(17).xy() } else { center }
 }
 
 /// Parse one entity record. POLYLINE/INSERT followers are handled by the caller.
@@ -365,14 +378,14 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
         "HELIX" => EntityKind::Helix(helix(tags)),
         "RAY" => EntityKind::Ray(RayLine { base: t.p(10), dir: t.p(11) }),
         "XLINE" => EntityKind::XLine(RayLine { base: t.p(10), dir: t.p(11) }),
-        "TEXT" => EntityKind::Text(text_from(&t)),
+        "TEXT" => EntityKind::Text(text_from(&t, false)),
         "MTEXT" => EntityKind::MText(mtext_from(tags, &c)),
         "ATTDEF" => {
             // A multiline definition has its text as embedded MTEXT after its own groups.
             let (own, embedded) = split_embedded(tags);
             let multiline = multiline_attrib(embedded, &c);
             let own = T(own);
-            let mut text = text_from(&own);
+            let mut text = text_from(&own, true);
             if let Some(m) = &multiline {
                 text.value.clone_from(&m.read_as);
             }
@@ -485,7 +498,7 @@ fn entity(kind: &str, tags: &[Tag]) -> Option<(Common, EntityKind)> {
             center: t.p(10),
             width: t.fd(40, 1.0),
             height: t.fd(41, 1.0),
-            view_center: Vec2::new(t.fd(12, 0.0), t.fd(22, 0.0)),
+            view_center: viewport_center(&t),
             view_height: t.fd(45, 1.0),
             id: t.i(69).unwrap_or(0) as u32,
             locked: t.i(90).unwrap_or(0) & 16384 != 0,
@@ -961,6 +974,8 @@ fn native_gradient(tags: &[Tag]) -> Option<Gradient> {
 /// Handle maps and references gathered while reading.
 #[derive(Default)]
 struct Rx {
+    /// LAYER record handle (upper case) → layer name (native VIEWPORT groups 331/341).
+    layers: HashMap<String, String>,
     /// STYLE record handle (upper case) → text style name.
     styles: HashMap<String, String>,
     /// BLOCK_RECORD handle (upper case) → block name.
@@ -983,16 +998,14 @@ struct Rx {
     pstyles: HashMap<String, String>,
     /// Upper-case block name → associative array parameters from its BLOCK_RECORD.
     block_arrays: HashMap<String, cadcraft_doc::ArrayParams>,
-    /// LAYER record handle (upper case) → layer name (VIEWPORT group 341 frozen layers).
-    layers: HashMap<String, String>,
 }
 
 /// The plot style names of a file: the entries of the `ACAD_PLOTSTYLENAME` dictionary of the
 /// named object dictionary (the first object), by placeholder handle.
-fn plot_style_names(secs: &[cadcraft_dxf::Section]) -> HashMap<String, String> {
+fn plot_style_names(secs: &[cadcraft_dxf::Section<&[Tag]>]) -> HashMap<String, String> {
     let mut out = HashMap::new();
     let Some(objects) = secs.iter().find(|s| s.name == "OBJECTS") else { return out };
-    let recs = records(&objects.tags);
+    let recs = records(objects.tags);
     let entries = |tags: &[Tag]| {
         let mut v: Vec<(String, String)> = Vec::new();
         let mut name: Option<String> = None;
@@ -1045,6 +1058,20 @@ fn entity_plot_style(tags: &[Tag], rx: &Rx) -> Option<String> {
 /// needs the file's handle maps.
 fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &mut Rx) {
     match (kind, k) {
+        // Prefer the explicit CADCraft freeze list; otherwise combine native layer handles.
+        ("VIEWPORT", EntityKind::Viewport(v)) if v.frozen_layers.is_empty() => {
+            for layer in tags
+                .iter()
+                .take_while(|t| t.code < 1000)
+                .filter(|t| matches!(t.code, 331 | 341))
+                .take(4096)
+                .filter_map(|t| rx.layers.get(&t.str().trim().to_ascii_uppercase()))
+            {
+                if !v.frozen_layers.iter().any(|n| n.eq_ignore_ascii_case(layer)) {
+                    v.frozen_layers.push(layer.clone());
+                }
+            }
+        }
         ("DIMENSION", EntityKind::Dimension(dm)) => {
             dm.overrides = crate::dxf_ext::read_dstyle(tags, &rx.styles, &rx.brs, &rx.ltypes);
             dm.assoc = crate::dxf_ext::read_assoc(tags);
@@ -1083,22 +1110,13 @@ fn entity_extras(kind: &str, tags: &[Tag], h: Handle, k: &mut EntityKind, rx: &m
             }
             rx.mleader_fix.push((h, pending));
         }
-        // CADCraft's VPFROZEN xdata wins; otherwise AutoCAD's group 341 layer handles.
-        ("VIEWPORT", EntityKind::Viewport(v)) if v.frozen_layers.is_empty() => {
-            v.frozen_layers = tags
-                .iter()
-                .take_while(|t| t.code < 1000)
-                .filter(|t| t.code == 341)
-                .filter_map(|t| rx.layers.get(&t.str().trim().to_ascii_uppercase()).cloned())
-                .collect();
-        }
         _ => {}
     }
 }
 
 /// Parse a run of entity records (ENTITIES section or a block's body) into entities. Records that
 /// can't be placed are counted in `skipped`.
-fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx, skipped: &mut usize) -> Vec<(Option<String>, bool, Entity)> {
+fn parse_entities(recs: &[(String, &[Tag])], d: &mut Drawing, rx: &mut Rx, skipped: &mut usize) -> Vec<(Option<String>, bool, Entity)> {
     let mut out = Vec::new();
     let mut i = 0;
     while let Some((kind, tags)) = recs.get(i) {
@@ -1181,7 +1199,7 @@ fn parse_entities(recs: &[(String, Vec<Tag>)], d: &mut Drawing, rx: &mut Rx, ski
                             let (own, embedded) = split_embedded(t2);
                             let multiline = multiline_attrib(embedded, &common(&tt));
                             let own = T(own);
-                            let mut text = text_from(&own);
+                            let mut text = text_from(&own, true);
                             if let Some(m) = &multiline {
                                 text.value.clone_from(&m.read_as);
                             }
@@ -1396,6 +1414,9 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
         let t = T(tg);
         let (Some(h), Some(n)) = (t.s(5), t.s(2)) else { continue };
         match kind.as_str() {
+            "LAYER" => {
+                rx.layers.insert(h.trim().to_ascii_uppercase(), n);
+            }
             "STYLE" => {
                 rx.styles.insert(h.trim().to_ascii_uppercase(), n);
             }
@@ -1410,15 +1431,12 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
             "LTYPE" => {
                 rx.ltypes.insert(h.trim().to_ascii_uppercase(), n);
             }
-            "LAYER" => {
-                rx.layers.insert(h.trim().to_ascii_uppercase(), n);
-            }
             _ => {}
         }
     }
     let mut active_vport = false;
     for (kind, tg) in recs {
-        let t = T(&tg);
+        let t = T(tg);
         match kind.as_str() {
             "LAYER" => {
                 let name = t.s(2).unwrap_or_default();
@@ -1445,11 +1463,11 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if let Some(n) = t.s(390).and_then(|h| rx.pstyles.get(&h.trim().to_ascii_uppercase())) {
                     l.plot_style = n.clone();
                 }
-                let alpha = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_TRANSPARENCY_APP).iter().find(|x| x.code == 1071);
+                let alpha = crate::dxf_ext::xdata(tg, crate::dxf_ext::LAYER_TRANSPARENCY_APP).iter().find(|x| x.code == 1071);
                 if let Some(pct) = alpha.and_then(|x| crate::dxf_ext::transparency_from_dxf(x.i64())) {
                     l.transparency = pct;
                 }
-                if let Some(desc) = crate::dxf_ext::xdata(&tg, crate::dxf_ext::LAYER_DESCRIPTION_APP).iter().filter(|x| x.code == 1000).nth(1) {
+                if let Some(desc) = crate::dxf_ext::xdata(tg, crate::dxf_ext::LAYER_DESCRIPTION_APP).iter().filter(|x| x.code == 1000).nth(1) {
                     l.description = desc.str();
                 }
                 match d.layer_mut(&name) {
@@ -1462,7 +1480,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if name.is_empty() || d.linetype(&name).is_some() {
                     continue;
                 }
-                let pattern = ltype_pattern(&tg, &ltype_styles);
+                let pattern = ltype_pattern(tg, &ltype_styles);
                 d.linetypes.push(Linetype { name, description: t.s(3).unwrap_or_default(), pattern });
             }
             "STYLE" => {
@@ -1474,7 +1492,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 let gen_flags = t.i(71).unwrap_or(0);
                 let st = TextStyle {
                     name: name.clone(),
-                    font: style_font(&tg, t.s(3).unwrap_or_default()),
+                    font: style_font(tg, t.s(3).unwrap_or_default()),
                     big_font: t.s(4).unwrap_or_default(),
                     height: t.fd(40, 0.0),
                     width_factor: t.fd(41, 1.0),
@@ -1482,7 +1500,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                     backwards: gen_flags & 2 != 0,
                     upside_down: gen_flags & 4 != 0,
                     vertical: t.i(70).unwrap_or(0) & 4 != 0,
-                    annotative: annotative(&tg),
+                    annotative: annotative(tg),
                 };
                 match d.text_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
@@ -1521,7 +1539,7 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                 if !(center.x.is_finite() && center.y.is_finite()) {
                     continue;
                 }
-                let x = crate::dxf_ext::xdata(&tg, crate::dxf_ext::APP);
+                let x = crate::dxf_ext::xdata(tg, crate::dxf_ext::APP);
                 let field = |key: &str| {
                     x.iter().position(|t| t.code == 1000 && t.str() == key).and_then(|i| x.get(i + 1)).filter(|t| t.code == 1000).map(Tag::str)
                 };
@@ -1561,8 +1579,8 @@ fn tables(tags: &[Tag], d: &mut Drawing, rx: &mut Rx) {
                         fields.insert(field.to_string(), v);
                     }
                 }
-                fields.extend(crate::dxf_ext::read_newer_dimvars(&tg, &rx.styles, &rx.brs, &rx.ltypes));
-                let mut st = DimStyle { name: name.clone(), annotative: annotative(&tg), ..DimStyle::default() };
+                fields.extend(crate::dxf_ext::read_newer_dimvars(tg, &rx.styles, &rx.brs, &rx.ltypes));
+                let mut st = DimStyle { name: name.clone(), annotative: annotative(tg), ..DimStyle::default() };
                 st.apply_fields(&fields);
                 match d.dim_styles.iter_mut().find(|s| s.name.eq_ignore_ascii_case(&name)) {
                     Some(x) => *x = st,
@@ -1657,7 +1675,7 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     d.layouts.clear();
     let mut rx = Rx { pstyles: plot_style_names(&secs), ..Rx::default() };
     let mut blocks: Vec<(String, Vec3, String, Vec<(Option<String>, bool, Entity)>, i64)> = Vec::new();
-    let mut layout_objs: Vec<(String, u32, String, PageSetup)> = Vec::new();
+    let mut layout_objs: Vec<(String, u32, String, PageSetup, bool)> = Vec::new();
     let mut entities = Vec::new();
     let mut objs = Objects::default();
     // Every handle another program's file already uses is taken before anything gets a new one:
@@ -1675,10 +1693,10 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     count_skipped(&mut skipped, "(no section)", outside_sections(&tags));
     for s in &secs {
         match s.name.as_str() {
-            "HEADER" => header(&s.tags, &mut d),
-            "TABLES" => tables(&s.tags, &mut d, &mut rx),
+            "HEADER" => header(s.tags, &mut d),
+            "TABLES" => tables(s.tags, &mut d, &mut rx),
             "BLOCKS" => {
-                let recs = records(&s.tags);
+                let recs = records(s.tags);
                 for (k, tg) in &recs {
                     let t = T(tg);
                     if k == "BLOCK" && t.i(70).unwrap_or(0) & 4 != 0 {
@@ -1716,12 +1734,12 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
             // A damaged file may split its entities over several ENTITIES sections (#865).
             "ENTITIES" => {
                 let mut n = 0;
-                entities.extend(parse_entities(&records(&s.tags), &mut d, &mut rx, &mut n));
+                entities.extend(parse_entities(&records(s.tags), &mut d, &mut rx, &mut n));
                 count_skipped(&mut skipped, "ENTITIES", n);
             }
             "OBJECTS" => {
-                for (k, tg) in records(&s.tags) {
-                    objs.add(&k, &tg);
+                for (k, tg) in records(s.tags) {
+                    objs.add(&k, tg);
                     if k == "LAYOUT" {
                         // Fields after the AcDbLayout marker (AcDbPlotSettings also has a code 1).
                         let start = tg.iter().position(|x| x.code == 100 && x.str() == "AcDbLayout").unwrap_or(0);
@@ -1730,7 +1748,19 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
                         // LAYOUT has two 330s: owner dict and the block record; take the last.
                         let br = tg.iter().rfind(|x| x.code == 330).map(Tag::str).unwrap_or_default();
                         let plot = T(tg.get(..start).unwrap_or(&[]));
-                        layout_objs.push((t.s(1).unwrap_or_default(), t.i(71).unwrap_or(0) as u32, br.to_ascii_uppercase(), page_setup(&plot)));
+                        // Never-activated native layouts have neither media dimensions nor an
+                        // overall paper viewport. Do not confuse a configured, empty sheet with one.
+                        let pending = plot.fd(44, 0.0) == 0.0
+                            && plot.fd(45, 0.0) == 0.0
+                            && plot.s(4).is_none_or(|n| n.is_empty())
+                            && t.s(331).is_none_or(|h| Handle::parse_hex(&h).is_none_or(|h| h.0 == 0));
+                        layout_objs.push((
+                            t.s(1).unwrap_or_default(),
+                            t.i(71).unwrap_or(0) as u32,
+                            br.to_ascii_uppercase(),
+                            page_setup(&plot),
+                            pending,
+                        ));
                     }
                 }
             }
@@ -1743,11 +1773,11 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     // Layouts.
     let mut paper_block_for: HashMap<String, String> = HashMap::new();
     layout_objs.sort_by_key(|l| l.1);
-    for (name, order, br, page) in &layout_objs {
+    for (name, order, br, page, pending) in &layout_objs {
         if name.eq_ignore_ascii_case("Model") {
             continue;
         }
-        d.layouts.push(Layout { page: page.clone(), ..Layout::new(name, *order) });
+        d.layouts.push(Layout { page: page.clone(), needs_initialization: *pending, ..Layout::new(name, *order) });
         if let Some(bname) = rx.brs.get(br) {
             paper_block_for.insert(bname.to_ascii_uppercase(), name.clone());
         }
@@ -1819,6 +1849,9 @@ pub fn read(bytes: &[u8]) -> Result<Drawing> {
     }
     apply_sortents(&mut d, &objs.sortents, &rx.brs, &paper_block_for, &first_layout);
     objs.apply(&mut d, &rx);
+    for l in &mut d.layouts {
+        l.needs_initialization &= l.entities.is_empty();
+    }
     crate::dxf_image::resolve(&secs, &mut d);
     crate::dxf_mline::resolve(&secs, &mut d);
     // Keep handles unique against the header's seed.
