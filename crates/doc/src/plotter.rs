@@ -112,6 +112,9 @@ pub struct PlotterConfig {
     pub orientation: Orientation,
     /// Name of the paper chosen when a page setup switches to this device.
     pub default_paper: String,
+    /// Name of a system printer. When set, a plot with this device is sent to that printer
+    /// instead of being written to a file (`output` must be `pdf` or `png`).
+    pub printer: String,
     pub papers: Vec<DevicePaper>,
 }
 
@@ -124,6 +127,7 @@ impl Default for PlotterConfig {
             resolution: 300,
             orientation: Orientation::Landscape,
             default_paper: String::new(),
+            printer: String::new(),
             papers: Vec::new(),
         }
     }
@@ -132,6 +136,13 @@ impl Default for PlotterConfig {
 /// A name trimmed, without control characters, at most [`MAX_PLOTTER_NAME`] characters.
 fn clean_name(s: &str) -> String {
     s.trim().chars().filter(|c| !c.is_control()).take(MAX_PLOTTER_NAME).collect::<String>().trim().to_string()
+}
+
+/// A system printer name: trimmed, without control characters, at most [`MAX_PLOTTER_NAME`]
+/// characters; empty when it would start with `-` (never mistaken for an option).
+pub fn clean_printer(s: &str) -> String {
+    let n = clean_name(s);
+    if n.starts_with('-') { String::new() } else { n }
 }
 
 /// Names compare ignoring case, spaces, `_` and `-`.
@@ -147,6 +158,7 @@ impl PlotterConfig {
         self.name = clean_name(&self.name);
         self.description = self.description.chars().filter(|c| !c.is_control() || *c == '\n').take(1000).collect();
         self.resolution = self.resolution.clamp(50, 2400);
+        self.printer = clean_printer(&self.printer);
         let mut papers: Vec<DevicePaper> = Vec::new();
         for p in std::mem::take(&mut self.papers).into_iter().take(MAX_DEVICE_PAPERS) {
             let p = p.sanitized();
@@ -249,5 +261,9 @@ mod tests {
         assert!(PlotterConfig::from_file_text(r#"{"cadcraftPlotter": 9, "name": "x"}"#).is_err());
         assert_eq!(plotter_file_name("../a/b:c").as_deref(), Some("___a_b_c.plotter.json"));
         assert_eq!(plotter_file_name("  "), None);
+        assert_eq!(clean_printer("  HP_LaserJet\n "), "HP_LaserJet");
+        assert_eq!(clean_printer("-o evil"), "");
+        let p = PlotterConfig { name: "Desk".into(), printer: "Office-1".into(), ..PlotterConfig::default() };
+        assert_eq!(PlotterConfig::from_file_text(&p.to_file_text()).unwrap().printer, "Office-1");
     }
 }

@@ -158,6 +158,7 @@ fn builtin(name: &str, output: PlotOutput, description: &str) -> PlotterConfig {
         resolution: 300,
         orientation: Orientation::Landscape,
         default_paper,
+        printer: String::new(),
         papers,
     }
 }
@@ -302,6 +303,10 @@ pub(crate) fn plot_options(s: &Session, p: &Value, cmd: &str) -> Result<Value> {
     let output = if cmd == "exportpdf" { PlotOutput::Pdf } else { dev.output };
     o.insert("output".into(), json!(output.as_str()));
     o.insert("resolution".into(), json!(dev.resolution));
+    // A device with a printer prints (never EXPORTPDF, which always writes a PDF file).
+    if cmd != "exportpdf" && !dev.printer.is_empty() {
+        o.insert("printer".into(), json!(dev.printer));
+    }
     let paper = match str_param(p, "paper") {
         Some(name) => match device_paper(&dev, name) {
             Some(pp) => Some(pp),
@@ -407,7 +412,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("plottermanager", "Plotter Manager...", run_plottermanager)
             .menu(&["File", "Plotter Manager..."])
             .params(
-                "{action?: list (default)|get|new|set|delete|load|save, name?: device, from?: device to copy (new), output?: pdf|png|svg, description?, resolution?: dpi, orientation?: portrait|landscape, defaultPaper?, paper?: {name, width, height (mm), margins?: [l,b,r,t] mm} (set: add or replace), removePaper?: name (set), text? (load), path? (save: native only; without it returns `text`)} (typed: option prompts)",
+                "{action?: list (default)|get|new|set|delete|load|save|printers (system printer names), name?: device, from?: device to copy (new), output?: pdf|png|svg, printer?: system printer name (plots on it instead of writing a file; \"\" clears; output pdf or png), description?, resolution?: dpi, orientation?: portrait|landscape, defaultPaper?, paper?: {name, width, height (mm), margins?: [l,b,r,t] mm} (set: add or replace), removePaper?: name (set), text? (load), path? (save: native only; without it returns `text`)} (typed: option prompts)",
             )
             .enabled(always)
             .noundo()
@@ -425,6 +430,7 @@ fn summary(c: &PlotterConfig) -> Value {
         "name": c.name,
         "description": c.description,
         "output": c.output.as_str(),
+        "printer": c.printer,
         "builtin": is_builtin(&c.name),
         "papers": c.papers.len(),
         "defaultPaper": c.default_paper,
@@ -459,6 +465,13 @@ fn edit_device(cmd: &str, c: &mut PlotterConfig, p: &Value) -> Result<()> {
     }
     if let Some(o) = p.get("output") {
         c.output = o.as_str().and_then(PlotOutput::parse).ok_or_else(|| bad(cmd, "`output` must be pdf, png or svg"))?;
+    }
+    if let Some(pr) = p.get("printer") {
+        let name = pr.as_str().ok_or_else(|| bad(cmd, "`printer` must be a system printer name (\"\" plots to a file)"))?;
+        c.printer = cadcraft_doc::clean_printer(name);
+        if c.printer.is_empty() && !name.trim().is_empty() {
+            return Err(bad(cmd, "`printer` must be a system printer name that doesn't start with `-`"));
+        }
     }
     if let Some(r) = p.get("resolution") {
         let r = r.as_u64().filter(|r| (50..=2400).contains(r)).ok_or_else(|| bad(cmd, "`resolution` must be 50-2400 dpi"))?;
@@ -523,6 +536,7 @@ fn run_plottermanager(_s: &mut Session, p: &Value) -> Result<Value> {
     let action = str_param(p, "action").unwrap_or("list").trim().to_ascii_lowercase();
     match action.as_str() {
         "list" => Ok(json!({ "devices": devices().iter().map(summary).collect::<Vec<_>>() })),
+        "printers" => Ok(json!({ "printers": super::printer::system_printers().map_err(|e| bad(cmd, e))? })),
         "get" => {
             let n = device_name(cmd, p)?;
             let c = find_device(&n).ok_or_else(|| unknown_device(cmd, &n))?;
@@ -615,7 +629,7 @@ fn run_plottermanager(_s: &mut Session, p: &Value) -> Result<Value> {
                 }
             }
         }
-        other => Err(bad(cmd, format!("unknown action `{other}` (list, get, new, set, delete, load, save)"))),
+        other => Err(bad(cmd, format!("unknown action `{other}` (list, get, new, set, delete, load, save, printers)"))),
     }
 }
 

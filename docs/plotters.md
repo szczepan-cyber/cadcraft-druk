@@ -45,7 +45,8 @@ files are not read; we haven't found a public specification of that format.
   "cadcraftPlotter": 1,
   "name": "Office A3",
   "description": "Raster proofs",
-  "output": "png",
+  "output": "pdf",
+  "printer": "Office_A3_Laser",
   "resolution": 150,
   "orientation": "landscape",
   "defaultPaper": "A3 borderless",
@@ -57,6 +58,9 @@ files are not read; we haven't found a public specification of that format.
 ```
 
 - `output` is `pdf`, `png` or `svg`.
+- `printer` (optional) names a system printer. A plot with the device is then sent to that
+  printer instead of being written to a file, so `output` must be `pdf` or `png`. The Plot
+  dialog is unchanged: pick the device, press OK, and no file dialog opens.
 - `resolution` is in dots per inch (50–2400) and applies to PNG.
 - `orientation` (`portrait` or `landscape`) is used when a page setup switches to the device.
 - Paper sizes are in millimetres on the portrait sheet. `margins` are left, bottom, right and
@@ -71,6 +75,15 @@ Reading fixes hostile values:
 - Files over 1 MB are refused.
 
 In the file name, characters other than letters, digits, spaces and `-_()+,` become `_`.
+
+## Printing on a system printer
+
+Set `printer` on a user device (`plottermanager {action: "set", name, printer}`; `action:
+"printers"` lists what the system offers; `printer: ""` goes back to files). Linux, macOS and
+FreeBSD print through CUPS (`lpstat`, `lp`). Windows uses PowerShell (`Get-Printer`, the `PrintTo`
+verb of the PDF viewer, so a PDF viewer must be installed). The web build has no system
+printers. `exportpdf` always writes a file. `plot` with a `path` writes the file even on a device
+with a printer.
 
 ## Commands
 

@@ -1029,7 +1029,9 @@ fn plot(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action {
     }
     if ok {
         let mut params = plot_params(&st, None);
-        if let Some(pick) = app.services.pick_save.as_ref() {
+        // A device with a system printer prints; there is no file to pick.
+        let printer = choices.devices.iter().find(|dv| dv.name.eq_ignore_ascii_case(&st.page.device)).is_some_and(|dv| !dv.printer.is_empty());
+        if !printer && let Some(pick) = app.services.pick_save.as_ref() {
             let title = app.session.state().map(|s| s.title.clone()).unwrap_or_default();
             let stem = std::path::Path::new(&title).file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
             let suggested = format!("{}-{}.{ext}", stem.unwrap_or_else(|| "Drawing".into()), st.target);
@@ -1042,9 +1044,10 @@ fn plot(app: &mut CadApp, ctx: &egui::Context, open: &mut bool) -> Action {
         *open = false;
         match app.run("plot", params) {
             Ok(r) => {
-                let msg = match r.get("path").and_then(Value::as_str) {
-                    Some(path) => format!("Plotted {} to {path}", st.target),
-                    None => format!("Plotted {} ({} bytes of PDF; there is no file dialog here)", st.target, r["bytes"]),
+                let msg = match (r.get("printer").and_then(Value::as_str), r.get("path").and_then(Value::as_str)) {
+                    (Some(printer), _) => format!("Sent {} to printer {printer}", st.target),
+                    (None, Some(path)) => format!("Plotted {} to {path}", st.target),
+                    (None, None) => format!("Plotted {} ({} bytes of PDF; there is no file dialog here)", st.target, r["bytes"]),
                 };
                 app.session.echo(msg);
             }

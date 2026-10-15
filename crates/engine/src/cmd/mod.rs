@@ -30,6 +30,7 @@ mod mtext_opts;
 mod overkill;
 mod pline_opts;
 pub mod plotters;
+pub mod printer;
 mod props;
 pub use props::MatchProps;
 mod qselect;

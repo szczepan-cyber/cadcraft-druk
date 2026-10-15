@@ -821,6 +821,14 @@ fn run_plot(s: &mut Session, p: &Value, cmd: &str) -> Result<Value> {
         None => space.tab_name().to_string(),
     };
     let pages = sheets.as_ref().map_or(1, Vec::len);
+    // A device with a printer sends the plot to it, unless a file path is asked for.
+    if str_param(p, "path").is_none()
+        && let Some(printer) = str_param(&opts, "printer").filter(|n| !n.is_empty())
+    {
+        let ext = opts.get("output").and_then(Value::as_str).unwrap_or("pdf").to_ascii_lowercase();
+        super::printer::print_bytes(printer, &bytes, &ext).map_err(|e| bad(cmd, e))?;
+        return Ok(json!({ "printer": printer, "bytes": bytes.len(), "layout": layout, "pages": pages }));
+    }
     match str_param(p, "path") {
         Some(_path) => {
             #[cfg(not(target_arch = "wasm32"))]
